@@ -1,0 +1,7 @@
+{
+  "security_keywords": ["password", "credential", "security", "breach"],
+  "required_fields": ["urgency"],
+  "clarification_question": "How urgent is this? (low / medium / high)",
+  "default_queue": "IT",
+  "default_route": "CREATE_DRAFT_TICKET"
+}
