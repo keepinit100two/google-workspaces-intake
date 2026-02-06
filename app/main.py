@@ -1,28 +1,32 @@
 from datetime import datetime
 import uuid
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Depends
 
-from app.core.idempotency import get_event, set_event
+from app.core.auth import require_ops_api_key
+from app.core.idempotency_store import SQLiteIdempotencyStore
 from app.core.logging import get_logger, log_event
-from app.domain.schemas import IngestRequest, Event, IngestResponse
+from app.domain.schemas import IngestRequest, IngestResponse, Event
 from app.services.router import route_event
 from app.services.actuator import execute_decision
 
 app = FastAPI(title="AI Control Plane")
 logger = get_logger()
 
-
-@app.get("/health")
-def health_check():
-    return {"status": "ok"}
+# Persistent idempotency store (survives restarts)
+idem_store = SQLiteIdempotencyStore()
 
 
-@app.post("/ingest/api", response_model=IngestResponse)
-def ingest_api(
-    req: IngestRequest,
-    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
-) -> IngestResponse:
+def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> IngestResponse:
+    """
+    Canonical ingest pipeline runner:
+      - enforce idempotency key
+      - reuse or create Event (persistent)
+      - Decide (router)
+      - Act v0 (safe execution)
+      - structured logging
+      - returns {event, decision}
+    """
     # Gate 1: Idempotency-Key is required
     if not idempotency_key:
         log_event(
@@ -30,14 +34,14 @@ def ingest_api(
             event_name="ingest_rejected",
             fields={
                 "reason": "missing_idempotency_key",
-                "event_type": req.event_type,
-                "source": req.source,
+                "event_type": ingest_req.event_type,
+                "source": ingest_req.source,
             },
         )
         raise HTTPException(status_code=400, detail="Missing Idempotency-Key header")
 
-    # Gate 2: Reuse existing Event if this key was already processed
-    existing_event = get_event(idempotency_key)
+    # Gate 2: Reuse existing Event if this key was already processed (persistent)
+    existing_event = idem_store.get(idempotency_key)
     if existing_event:
         log_event(
             logger,
@@ -91,19 +95,18 @@ def ingest_api(
                     "error": str(e),
                 },
             )
-            # We do not fail the whole request in Tier-1 v0; we stay observable and safe.
 
         return IngestResponse(event=existing_event, decision=decision)
 
-    # New Event
+    # Create new canonical Event
     event = Event(
         event_id=str(uuid.uuid4()),
-        event_type=req.event_type,
-        source=req.source,
+        event_type=ingest_req.event_type,
+        source=ingest_req.source,
         timestamp=datetime.utcnow(),
-        actor=req.actor,
-        payload=req.payload,
-        metadata=req.metadata,
+        actor=ingest_req.actor,
+        payload=ingest_req.payload,
+        metadata=ingest_req.metadata,
     )
 
     log_event(
@@ -116,6 +119,9 @@ def ingest_api(
             "source": event.source,
         },
     )
+
+    # Persist Event for idempotency (survives restart)
+    idem_store.set(idempotency_key, event)
 
     # Decide
     decision = route_event(event)
@@ -130,9 +136,6 @@ def ingest_api(
             "reason": decision.reason,
         },
     )
-
-    # Persist Event for idempotency
-    set_event(idempotency_key, event)
 
     # Act (safe execution)
     try:
@@ -161,6 +164,27 @@ def ingest_api(
                 "error": str(e),
             },
         )
-        # We do not fail the whole request in Tier-1 v0; we stay observable and safe.
 
     return IngestResponse(event=event, decision=decision)
+
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
+
+
+@app.get("/ops/ping")
+def ops_ping(_: None = Depends(require_ops_api_key)):
+    """
+    Minimal protected ops endpoint.
+    Requires header: X-API-Key: <OPS_API_KEY>
+    """
+    return {"status": "ok"}
+
+
+@app.post("/ingest/api", response_model=IngestResponse)
+def ingest_api(
+    req: IngestRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> IngestResponse:
+    return _process_ingest(req, idempotency_key)
