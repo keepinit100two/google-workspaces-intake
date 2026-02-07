@@ -1,9 +1,11 @@
 import json
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
 from app.main import app
 import app.services.actuator as actuator
+from app.core.artifacts import LocalArtifactStore
 
 client = TestClient(app)
 
@@ -14,7 +16,7 @@ def test_create_draft_ticket_writes_artifact(tmp_path, monkeypatch):
     We redirect draft output to tmp_path so tests don't touch real artifacts/.
     """
     draft_dir = tmp_path / "drafts"
-    monkeypatch.setattr(actuator, "DRAFT_DIR", draft_dir)
+    monkeypatch.setattr(actuator, "artifact_store", LocalArtifactStore(draft_dir))
 
     payload = {
         "event_type": "support_request",
@@ -32,8 +34,9 @@ def test_create_draft_ticket_writes_artifact(tmp_path, monkeypatch):
     body = resp.json()
     event_id = body["event"]["event_id"]
     decision_id = body["decision"]["decision_id"]
+    route = body["decision"]["route"]
 
-    assert body["decision"]["route"] == "CREATE_DRAFT_TICKET"
+    assert route == "CREATE_DRAFT_TICKET"
 
     artifact_path = draft_dir / f"{event_id}.draft_ticket.json"
     assert artifact_path.exists()
@@ -50,7 +53,7 @@ def test_escalation_does_not_write_artifact(tmp_path, monkeypatch):
     ESCALATE_HUMAN must not produce any draft artifacts.
     """
     draft_dir = tmp_path / "drafts"
-    monkeypatch.setattr(actuator, "DRAFT_DIR", draft_dir)
+    monkeypatch.setattr(actuator, "artifact_store", LocalArtifactStore(draft_dir))
 
     payload = {
         "event_type": "support_request",
@@ -68,6 +71,7 @@ def test_escalation_does_not_write_artifact(tmp_path, monkeypatch):
     decision = resp.json()["decision"]
     assert decision["route"] == "ESCALATE_HUMAN"
 
+    # No artifact should exist
     assert not draft_dir.exists() or not any(draft_dir.iterdir())
 
 
@@ -76,7 +80,7 @@ def test_request_more_info_does_not_write_artifact(tmp_path, monkeypatch):
     REQUEST_MORE_INFO must not produce any draft artifacts.
     """
     draft_dir = tmp_path / "drafts"
-    monkeypatch.setattr(actuator, "DRAFT_DIR", draft_dir)
+    monkeypatch.setattr(actuator, "artifact_store", LocalArtifactStore(draft_dir))
 
     payload = {
         "event_type": "support_request",
@@ -94,11 +98,5 @@ def test_request_more_info_does_not_write_artifact(tmp_path, monkeypatch):
     decision = resp.json()["decision"]
     assert decision["route"] == "REQUEST_MORE_INFO"
 
+    # No artifact should exist
     assert not draft_dir.exists() or not any(draft_dir.iterdir())
-
-
-# TODO: Add a config regression test later (prefer integration-style: temporarily write configs/routing.json,
-# reload router module, assert routing changes, then restore original config).
-
-
-
