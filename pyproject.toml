@@ -1,0 +1,4 @@
+[tool.poe.tasks]
+dev = "uvicorn app.main:app --reload --port 8080"
+report = "python ops/weekly_report.py"
+ 
