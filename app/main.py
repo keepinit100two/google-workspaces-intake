@@ -6,23 +6,46 @@ from fastapi import FastAPI, Header, HTTPException, Depends
 from app.core.auth import require_ops_api_key
 from app.core.idempotency_store import get_idempotency_store
 from app.core.logging import get_logger, log_event
-from app.domain.schemas import IngestRequest, IngestResponse, Event
+from app.domain.schemas import IngestRequest, IngestResponse, Event, GmailIngestRequest
+from app.services.normalizer import normalize_gmail_ingest
 from app.services.router import route_event
 from app.services.actuator import execute_decision
 
 app = FastAPI(title="AI Control Plane")
 logger = get_logger()
 
-# Idempotency store backend is now selectable (sqlite for local, firestore for shared)
+# Idempotency store backend is selectable (sqlite for local, firestore for shared)
 idem_store = get_idempotency_store()
+
+
+def _gmail_idempotency_key(greq: GmailIngestRequest) -> str:
+    """
+    Deterministic idempotency key for Gmail ingest.
+
+    Priority:
+      1) message_id (best)
+      2) history_id (fallback for watch/history style ingestion)
+      3) else reject (cannot guarantee deterministic dedupe across retries)
+    """
+    mailbox = greq.mailbox.strip().lower()
+
+    if greq.message_id:
+        return f"gmail:mailbox={mailbox}:message_id={greq.message_id}"
+    if greq.history_id:
+        return f"gmail:mailbox={mailbox}:history_id={greq.history_id}"
+
+    # No stable id => cannot guarantee idempotency across retries
+    raise HTTPException(
+        status_code=400,
+        detail="Gmail ingest requires message_id or history_id for deterministic idempotency",
+    )
 
 
 def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> IngestResponse:
     """
     Canonical ingest pipeline runner:
-      - enforce Idempotency-Key header
+      - enforce Idempotency-Key (or derived idempotency key for typed ingest endpoints)
       - shared claim/lease (multi-server safe)
-      - reuse or create Event (persistent)
       - Decide (router)
       - Act v0 (safe execution)
       - structured logging
@@ -53,8 +76,6 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
     )
 
     # Gate 2: Shared idempotency claim (multi-server safe)
-    # - If claimed=True: we own processing lease
-    # - If claimed=False: another worker owns it OR it is already completed
     claim = idem_store.try_claim(
         key=idempotency_key,
         event=candidate_event,
@@ -64,7 +85,6 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
 
     if not claim.claimed:
         # Deterministic duplicate behavior: do not silently drop.
-        # We will reuse the stored event if available.
         existing_event = claim.existing_event or idem_store.get(idempotency_key) or candidate_event
 
         log_event(
@@ -95,8 +115,7 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
             },
         )
 
-        # Act (safe execution)
-        # NOTE: Act-level idempotency will be strengthened later. For now we preserve existing behavior.
+        # Act (safe execution) — act-level idempotency will be strengthened later
         try:
             action_result = execute_decision(existing_event, decision)
             log_event(
@@ -204,8 +223,6 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
                 "owner_id": claim.owner_id,
             },
         )
-
-        # Preserve existing behavior: do not crash silently; surface as HTTP error
         raise
 
     return IngestResponse(event=event, decision=decision)
@@ -230,4 +247,50 @@ def ingest_api(
     req: IngestRequest,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> IngestResponse:
+    """
+    Generic ingest endpoint: caller supplies Idempotency-Key header.
+    """
     return _process_ingest(req, idempotency_key)
+
+
+@app.post("/ingest/gmail", response_model=IngestResponse)
+def ingest_gmail(req: GmailIngestRequest) -> IngestResponse:
+    """
+    Gmail ingest endpoint:
+      - accepts GmailIngestRequest (trigger envelope)
+      - normalizes to canonical IngestRequest
+      - derives deterministic idempotency key
+      - runs canonical pipeline
+    """
+    try:
+        idempotency_key = _gmail_idempotency_key(req)
+    except HTTPException:
+        log_event(
+            logger,
+            event_name="ingest_rejected",
+            fields={
+                "reason": "missing_gmail_id",
+                "mailbox": req.mailbox,
+                "trigger_type": req.trigger_type,
+                "trace_id": req.trace_id,
+            },
+        )
+        raise
+
+    canonical_req = normalize_gmail_ingest(req)
+
+    log_event(
+        logger,
+        event_name="gmail_normalized",
+        fields={
+            "idempotency_key": idempotency_key,
+            "mailbox": req.mailbox,
+            "trigger_type": req.trigger_type,
+            "message_id": req.message_id,
+            "thread_id": req.thread_id,
+            "history_id": req.history_id,
+            "trace_id": req.trace_id,
+        },
+    )
+
+    return _process_ingest(canonical_req, idempotency_key)
