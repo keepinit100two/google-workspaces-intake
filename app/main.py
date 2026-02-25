@@ -4,6 +4,7 @@ import uuid
 from fastapi import FastAPI, Header, HTTPException, Depends
 
 from app.core.auth import require_ops_api_key
+from app.core.cursor_store import get_mailbox_cursor_store
 from app.core.idempotency_store import get_idempotency_store
 from app.core.logging import get_logger, log_event
 from app.domain.schemas import IngestRequest, IngestResponse, Event, GmailIngestRequest
@@ -16,6 +17,9 @@ logger = get_logger()
 
 # Idempotency store backend is selectable (sqlite for local, firestore for shared)
 idem_store = get_idempotency_store()
+
+# Mailbox cursor store backend is selectable (sqlite for local, firestore for shared)
+cursor_store = get_mailbox_cursor_store()
 
 
 def _gmail_idempotency_key(greq: GmailIngestRequest) -> str:
@@ -34,7 +38,6 @@ def _gmail_idempotency_key(greq: GmailIngestRequest) -> str:
     if greq.history_id:
         return f"gmail:mailbox={mailbox}:history_id={greq.history_id}"
 
-    # No stable id => cannot guarantee idempotency across retries
     raise HTTPException(
         status_code=400,
         detail="Gmail ingest requires message_id or history_id for deterministic idempotency",
@@ -48,6 +51,7 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
       - shared claim/lease (multi-server safe)
       - Decide (router)
       - Act v0 (safe execution)
+      - mailbox cursor advance (if applicable) after successful completion
       - structured logging
       - returns {event, decision}
     """
@@ -64,6 +68,10 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
         )
         raise HTTPException(status_code=400, detail="Missing Idempotency-Key header")
 
+    # Late-event flags (set by upstream typed ingest endpoints like /ingest/gmail)
+    is_late_event = bool(ingest_req.metadata.get("is_late_event", False))
+    late_reason = ingest_req.metadata.get("late_reason")
+
     # Create a candidate canonical Event (used if we win the claim)
     candidate_event = Event(
         event_id=str(uuid.uuid4()),
@@ -73,6 +81,10 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
         actor=ingest_req.actor,
         payload=ingest_req.payload,
         metadata=ingest_req.metadata,
+        gmail=None,
+        ordering=None,
+        is_late_event=is_late_event,
+        late_reason=late_reason,
     )
 
     # Gate 2: Shared idempotency claim (multi-server safe)
@@ -114,6 +126,9 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
                 "idempotency_key": idempotency_key,
             },
         )
+
+        # We do NOT advance mailbox cursor on a duplicate responder path.
+        # Cursor advance only occurs on the single processor that marks completed.
 
         # Act (safe execution) — act-level idempotency will be strengthened later
         try:
@@ -159,6 +174,8 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
             "event_type": event.event_type,
             "source": event.source,
             "owner_id": claim.owner_id,
+            "is_late_event": event.is_late_event,
+            "late_reason": event.late_reason,
         },
     )
 
@@ -174,8 +191,27 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
             "risk_level": decision.risk_level,
             "reason": decision.reason,
             "idempotency_key": idempotency_key,
+            "is_late_event": event.is_late_event,
+            "late_reason": event.late_reason,
         },
     )
+
+    # Cursor policy enforcement:
+    # If event is late, do NOT mutate external state (no Act). We still mark completed.
+    if event.is_late_event:
+        idem_store.mark_completed(key=idempotency_key, owner_id=claim.owner_id or "unknown")
+        log_event(
+            logger,
+            event_name="late_event_noop",
+            fields={
+                "idempotency_key": idempotency_key,
+                "event_id": event.event_id,
+                "decision_id": decision.decision_id,
+                "owner_id": claim.owner_id,
+                "late_reason": event.late_reason,
+            },
+        )
+        return IngestResponse(event=event, decision=decision)
 
     # Act (safe execution)
     try:
@@ -207,6 +243,24 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
                 "owner_id": claim.owner_id,
             },
         )
+
+        # Mailbox cursor advance (Gmail only), only after completion, only if not-late
+        if ingest_req.source == "gmail":
+            mailbox = ingest_req.payload.get("mailbox")
+            history_id = ingest_req.payload.get("history_id")
+            if mailbox and history_id:
+                advanced = cursor_store.try_advance(mailbox=mailbox, new_history_id=str(history_id))
+                log_event(
+                    logger,
+                    event_name="mailbox_cursor_advanced" if advanced else "mailbox_cursor_unchanged",
+                    fields={
+                        "mailbox": mailbox,
+                        "history_id": history_id,
+                        "advanced": advanced,
+                        "idempotency_key": idempotency_key,
+                        "event_id": event.event_id,
+                    },
+                )
 
     except Exception as e:
         # Explicit failure handling: mark failed so retries can reclaim deterministically
@@ -258,6 +312,7 @@ def ingest_gmail(req: GmailIngestRequest) -> IngestResponse:
     """
     Gmail ingest endpoint:
       - accepts GmailIngestRequest (trigger envelope)
+      - mailbox cursor check (late/out-of-order detection)
       - normalizes to canonical IngestRequest
       - derives deterministic idempotency key
       - runs canonical pipeline
@@ -277,7 +332,22 @@ def ingest_gmail(req: GmailIngestRequest) -> IngestResponse:
         )
         raise
 
+    # Cursor check (ordering enforcement). This is policy, not just metadata.
+    cursor_check = cursor_store.check_late(mailbox=req.mailbox, incoming_history_id=req.history_id)
+    is_late_event = bool(cursor_check.is_late)
+    late_reason = cursor_check.reason if is_late_event else None
+
     canonical_req = normalize_gmail_ingest(req)
+
+    # Persist late-event determination into canonical metadata so _process_ingest can enforce no-op
+    canonical_req.metadata["is_late_event"] = is_late_event
+    canonical_req.metadata["late_reason"] = late_reason
+    canonical_req.metadata["cursor_check"] = {
+        "incoming_history_id": cursor_check.incoming_history_id,
+        "current_history_id": cursor_check.current_history_id,
+        "reason": cursor_check.reason,
+        "is_late": cursor_check.is_late,
+    }
 
     log_event(
         logger,
@@ -290,6 +360,11 @@ def ingest_gmail(req: GmailIngestRequest) -> IngestResponse:
             "thread_id": req.thread_id,
             "history_id": req.history_id,
             "trace_id": req.trace_id,
+            "is_late_event": is_late_event,
+            "late_reason": late_reason,
+            "cursor_reason": cursor_check.reason,
+            "cursor_incoming": cursor_check.incoming_history_id,
+            "cursor_current": cursor_check.current_history_id,
         },
     )
 
