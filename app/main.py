@@ -6,6 +6,7 @@ from fastapi import FastAPI, Header, HTTPException, Depends
 
 from app.core.auth import require_ops_api_key
 from app.core.cursor_store import get_mailbox_cursor_store
+from app.core.failure_sink import get_failure_sink, make_failure
 from app.core.idempotency_store import get_idempotency_store
 from app.core.logging import get_logger, log_event
 from app.domain.schemas import IngestRequest, IngestResponse, Event, GmailIngestRequest
@@ -16,33 +17,17 @@ from app.services.actuator import execute_decision
 app = FastAPI(title="AI Control Plane")
 logger = get_logger()
 
-# Idempotency store backend is selectable (sqlite for local, firestore for shared)
 idem_store = get_idempotency_store()
-
-# Mailbox cursor store backend is selectable (sqlite for local, firestore for shared)
 cursor_store = get_mailbox_cursor_store()
+failure_sink = get_failure_sink()
 
 
 def _is_shadow_mode() -> bool:
-    """
-    Shadow mode = compute decisions + log, but do NOT execute Act or advance cursor.
-    Controlled via env var SHADOW_MODE.
-
-    Truthy values: "1", "true", "yes", "on"
-    """
     v = os.getenv("SHADOW_MODE", "").strip().lower()
     return v in {"1", "true", "yes", "on"}
 
 
 def _gmail_idempotency_key(greq: GmailIngestRequest) -> str:
-    """
-    Deterministic idempotency key for Gmail ingest.
-
-    Priority:
-      1) message_id (best)
-      2) history_id (fallback for watch/history style ingestion)
-      3) else reject (cannot guarantee deterministic dedupe across retries)
-    """
     mailbox = greq.mailbox.strip().lower()
 
     if greq.message_id:
@@ -57,17 +42,6 @@ def _gmail_idempotency_key(greq: GmailIngestRequest) -> str:
 
 
 def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> IngestResponse:
-    """
-    Canonical ingest pipeline runner:
-      - enforce Idempotency-Key (or derived idempotency key for typed ingest endpoints)
-      - shared claim/lease (multi-server safe)
-      - Decide (router)
-      - Act v0 (safe execution) unless late-event or shadow mode
-      - mailbox cursor advance (if applicable) after successful completion
-      - structured logging
-      - returns {event, decision}
-    """
-    # Gate 1: Idempotency-Key is required
     if not idempotency_key:
         log_event(
             logger,
@@ -78,15 +52,23 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
                 "source": ingest_req.source,
             },
         )
+        failure_sink.notify(
+            make_failure(
+                stage="ingest",
+                error_code="INGEST_REJECTED_MISSING_IDEMPOTENCY_KEY",
+                message="Missing Idempotency-Key header",
+                context={
+                    "event_type": ingest_req.event_type,
+                    "source": ingest_req.source,
+                },
+            )
+        )
         raise HTTPException(status_code=400, detail="Missing Idempotency-Key header")
 
     shadow_mode = _is_shadow_mode()
-
-    # Late-event flags (set by upstream typed ingest endpoints like /ingest/gmail)
     is_late_event = bool(ingest_req.metadata.get("is_late_event", False))
     late_reason = ingest_req.metadata.get("late_reason")
 
-    # Create a candidate canonical Event (used if we win the claim)
     candidate_event = Event(
         event_id=str(uuid.uuid4()),
         event_type=ingest_req.event_type,
@@ -101,7 +83,6 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
         late_reason=late_reason,
     )
 
-    # Gate 2: Shared idempotency claim (multi-server safe)
     claim = idem_store.try_claim(
         key=idempotency_key,
         event=candidate_event,
@@ -110,7 +91,6 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
     )
 
     if not claim.claimed:
-        # Deterministic duplicate behavior: do not silently drop.
         existing_event = claim.existing_event or idem_store.get(idempotency_key) or candidate_event
 
         log_event(
@@ -127,7 +107,6 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
             },
         )
 
-        # Decide
         decision = route_event(existing_event)
         log_event(
             logger,
@@ -143,12 +122,6 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
             },
         )
 
-        # IMPORTANT:
-        # We do NOT enforce shadow-mode behavior on the duplicate responder path here.
-        # The canonical behavior is enforced on the single processor path that holds the claim
-        # and marks completed. This keeps "one writer" responsible for state mutations.
-
-        # Act (safe execution) — act-level idempotency will be strengthened later
         try:
             action_result = execute_decision(existing_event, decision)
             log_event(
@@ -179,10 +152,22 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
                     "shadow_mode": shadow_mode,
                 },
             )
+            failure_sink.notify(
+                make_failure(
+                    stage="act",
+                    error_code="ACT_FAILED_DUPLICATE_PATH",
+                    message=str(e),
+                    context={
+                        "idempotency_key": idempotency_key,
+                        "event_id": existing_event.event_id,
+                        "decision_id": decision.decision_id,
+                        "route": decision.route,
+                    },
+                )
+            )
 
         return IngestResponse(event=existing_event, decision=decision)
 
-    # We own the lease: proceed as the single processor
     event = candidate_event
 
     log_event(
@@ -200,7 +185,6 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
         },
     )
 
-    # Decide
     decision = route_event(event)
     log_event(
         logger,
@@ -219,7 +203,6 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
         },
     )
 
-    # 1) Governance no-op for late events (ordering enforcement)
     if event.is_late_event:
         idem_store.mark_completed(key=idempotency_key, owner_id=claim.owner_id or "unknown")
         log_event(
@@ -236,7 +219,6 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
         )
         return IngestResponse(event=event, decision=decision)
 
-    # 2) Shadow mode no-op (compute + log only; no Act, no cursor advance)
     if shadow_mode:
         idem_store.mark_completed(key=idempotency_key, owner_id=claim.owner_id or "unknown")
         log_event(
@@ -252,7 +234,6 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
         )
         return IngestResponse(event=event, decision=decision)
 
-    # Act (safe execution)
     try:
         action_result = execute_decision(event, decision)
         log_event(
@@ -270,7 +251,6 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
             },
         )
 
-        # Mark completed only after successful Decide+Act path completes
         idem_store.mark_completed(key=idempotency_key, owner_id=claim.owner_id or "unknown")
         log_event(
             logger,
@@ -283,8 +263,6 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
             },
         )
 
-        # Mailbox cursor advance (Gmail only), only after completion, only if not-late and not shadow-mode
-        # Policy A: if history_id missing, we do not advance cursor.
         if ingest_req.source == "gmail":
             mailbox = ingest_req.payload.get("mailbox")
             history_id = ingest_req.payload.get("history_id")
@@ -314,7 +292,6 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
                 )
 
     except Exception as e:
-        # Explicit failure handling: mark failed so retries can reclaim deterministically
         idem_store.mark_failed(key=idempotency_key, owner_id=claim.owner_id or "unknown", error=str(e))
         log_event(
             logger,
@@ -329,6 +306,20 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
                 "shadow_mode": shadow_mode,
             },
         )
+        failure_sink.notify(
+            make_failure(
+                stage="act",
+                error_code="ACT_FAILED_SINGLE_PROCESSOR",
+                message=str(e),
+                context={
+                    "idempotency_key": idempotency_key,
+                    "event_id": event.event_id,
+                    "decision_id": decision.decision_id,
+                    "route": decision.route,
+                    "source": ingest_req.source,
+                },
+            )
+        )
         raise
 
     return IngestResponse(event=event, decision=decision)
@@ -341,10 +332,6 @@ def health_check():
 
 @app.get("/ops/ping")
 def ops_ping(_: None = Depends(require_ops_api_key)):
-    """
-    Minimal protected ops endpoint.
-    Requires header: X-API-Key: <OPS_API_KEY>
-    """
     return {"status": "ok"}
 
 
@@ -353,25 +340,14 @@ def ingest_api(
     req: IngestRequest,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> IngestResponse:
-    """
-    Generic ingest endpoint: caller supplies Idempotency-Key header.
-    """
     return _process_ingest(req, idempotency_key)
 
 
 @app.post("/ingest/gmail", response_model=IngestResponse)
 def ingest_gmail(req: GmailIngestRequest) -> IngestResponse:
-    """
-    Gmail ingest endpoint:
-      - accepts GmailIngestRequest (trigger envelope)
-      - mailbox cursor check (late/out-of-order detection)
-      - normalizes to canonical IngestRequest
-      - derives deterministic idempotency key
-      - runs canonical pipeline
-    """
     try:
         idempotency_key = _gmail_idempotency_key(req)
-    except HTTPException:
+    except HTTPException as e:
         log_event(
             logger,
             event_name="ingest_rejected",
@@ -382,20 +358,28 @@ def ingest_gmail(req: GmailIngestRequest) -> IngestResponse:
                 "trace_id": req.trace_id,
             },
         )
+        failure_sink.notify(
+            make_failure(
+                stage="ingest",
+                error_code="INGEST_REJECTED_MISSING_GMAIL_IDS",
+                message=str(e.detail),
+                context={
+                    "mailbox": req.mailbox,
+                    "trigger_type": req.trigger_type,
+                    "trace_id": req.trace_id,
+                },
+            )
+        )
         raise
 
-    # Cursor check (ordering enforcement). This is policy, not just metadata.
     cursor_check = cursor_store.check_late(mailbox=req.mailbox, incoming_history_id=req.history_id)
     is_late_event = bool(cursor_check.is_late)
     late_reason = cursor_check.reason if is_late_event else None
 
     canonical_req = normalize_gmail_ingest(req)
 
-    # Policy A: missing history_id is allowed but must be signaled deterministically.
     ordering_signal_missing = req.history_id is None
     canonical_req.metadata["ordering_signal_missing"] = ordering_signal_missing
-
-    # Persist late-event determination into canonical metadata so _process_ingest can enforce no-op
     canonical_req.metadata["is_late_event"] = is_late_event
     canonical_req.metadata["late_reason"] = late_reason
     canonical_req.metadata["cursor_check"] = {
