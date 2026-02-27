@@ -1,7 +1,10 @@
 {
-  "security_keywords": ["password", "credential", "security", "breach"],
-  "required_fields": ["urgency"],
-  "clarification_question": "How urgent is this? (low / medium / high)",
-  "default_queue": "IT",
-  "default_route": "CREATE_DRAFT_TICKET"
+  "version": "1.0",
+  "routes": [
+    "NOOP_LATE_EVENT",
+    "ESCALATE_HUMAN",
+    "REQUEST_MORE_INFO",
+    "CREATE_DRAFT_TICKET"
+  ],
+  "rules": []
 }

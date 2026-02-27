@@ -5,6 +5,7 @@ import uuid
 from fastapi import FastAPI, Header, HTTPException, Depends
 
 from app.core.auth import require_ops_api_key
+from app.core.config_loader import load_routing_config
 from app.core.cursor_store import get_mailbox_cursor_store
 from app.core.failure_sink import get_failure_sink, make_failure
 from app.core.idempotency_store import get_idempotency_store
@@ -23,11 +24,66 @@ failure_sink = get_failure_sink()
 
 
 def _is_shadow_mode() -> bool:
+    """
+    Shadow mode = compute decisions + log, but do NOT execute Act or advance cursor.
+    Controlled via env var SHADOW_MODE.
+
+    Truthy values: "1", "true", "yes", "on"
+    """
     v = os.getenv("SHADOW_MODE", "").strip().lower()
     return v in {"1", "true", "yes", "on"}
 
 
+@app.on_event("startup")
+def _startup_validate_configs() -> None:
+    """
+    Startup config validation gate.
+    Fail fast if policy-as-data configs are malformed.
+    """
+    try:
+        routing_cfg = load_routing_config()
+        app.state.routing_config = routing_cfg  # stored for future use by router
+        log_event(
+            logger,
+            event_name="config_validated",
+            fields={
+                "config": "routing.json",
+                "version": routing_cfg.version,
+                "routes_count": len(routing_cfg.routes),
+                "rules_count": len(routing_cfg.rules),
+            },
+        )
+    except Exception as e:
+        # Explicit surfacing: no silent startup failure
+        log_event(
+            logger,
+            event_name="config_validation_failed",
+            fields={
+                "config": "routing.json",
+                "error": str(e),
+            },
+        )
+        failure_sink.notify(
+            make_failure(
+                stage="observe",
+                error_code="CONFIG_VALIDATION_FAILED",
+                message=str(e),
+                context={"config": "routing.json"},
+            )
+        )
+        # Crash startup intentionally (fail fast)
+        raise
+
+
 def _gmail_idempotency_key(greq: GmailIngestRequest) -> str:
+    """
+    Deterministic idempotency key for Gmail ingest.
+
+    Priority:
+      1) message_id (best)
+      2) history_id (fallback for watch/history style ingestion)
+      3) else reject (cannot guarantee deterministic dedupe across retries)
+    """
     mailbox = greq.mailbox.strip().lower()
 
     if greq.message_id:
@@ -42,6 +98,16 @@ def _gmail_idempotency_key(greq: GmailIngestRequest) -> str:
 
 
 def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> IngestResponse:
+    """
+    Canonical ingest pipeline runner:
+      - enforce Idempotency-Key (or derived idempotency key for typed ingest endpoints)
+      - shared claim/lease (multi-server safe)
+      - Decide (router)
+      - Act v0 (safe execution) unless late-event or shadow mode
+      - mailbox cursor advance (if applicable) after successful completion
+      - structured logging
+      - returns {event, decision}
+    """
     if not idempotency_key:
         log_event(
             logger,
@@ -121,6 +187,9 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
                 "shadow_mode": shadow_mode,
             },
         )
+
+        # We do not enforce shadow-mode on duplicate responder path.
+        # Single processor path is the source of truth for mutations and completion.
 
         try:
             action_result = execute_decision(existing_event, decision)
@@ -203,6 +272,7 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
         },
     )
 
+    # Governance no-op for late events
     if event.is_late_event:
         idem_store.mark_completed(key=idempotency_key, owner_id=claim.owner_id or "unknown")
         log_event(
@@ -219,6 +289,7 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
         )
         return IngestResponse(event=event, decision=decision)
 
+    # Shadow-mode no-op
     if shadow_mode:
         idem_store.mark_completed(key=idempotency_key, owner_id=claim.owner_id or "unknown")
         log_event(
