@@ -1,4 +1,5 @@
 from datetime import datetime
+import os
 import uuid
 
 from fastapi import FastAPI, Header, HTTPException, Depends
@@ -20,6 +21,17 @@ idem_store = get_idempotency_store()
 
 # Mailbox cursor store backend is selectable (sqlite for local, firestore for shared)
 cursor_store = get_mailbox_cursor_store()
+
+
+def _is_shadow_mode() -> bool:
+    """
+    Shadow mode = compute decisions + log, but do NOT execute Act or advance cursor.
+    Controlled via env var SHADOW_MODE.
+
+    Truthy values: "1", "true", "yes", "on"
+    """
+    v = os.getenv("SHADOW_MODE", "").strip().lower()
+    return v in {"1", "true", "yes", "on"}
 
 
 def _gmail_idempotency_key(greq: GmailIngestRequest) -> str:
@@ -50,7 +62,7 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
       - enforce Idempotency-Key (or derived idempotency key for typed ingest endpoints)
       - shared claim/lease (multi-server safe)
       - Decide (router)
-      - Act v0 (safe execution)
+      - Act v0 (safe execution) unless late-event or shadow mode
       - mailbox cursor advance (if applicable) after successful completion
       - structured logging
       - returns {event, decision}
@@ -67,6 +79,8 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
             },
         )
         raise HTTPException(status_code=400, detail="Missing Idempotency-Key header")
+
+    shadow_mode = _is_shadow_mode()
 
     # Late-event flags (set by upstream typed ingest endpoints like /ingest/gmail)
     is_late_event = bool(ingest_req.metadata.get("is_late_event", False))
@@ -109,6 +123,7 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
                 "event_type": existing_event.event_type,
                 "source": existing_event.source,
                 "owner_id": claim.owner_id,
+                "shadow_mode": shadow_mode,
             },
         )
 
@@ -124,11 +139,14 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
                 "risk_level": decision.risk_level,
                 "reason": decision.reason,
                 "idempotency_key": idempotency_key,
+                "shadow_mode": shadow_mode,
             },
         )
 
-        # We do NOT advance mailbox cursor on a duplicate responder path.
-        # Cursor advance only occurs on the single processor that marks completed.
+        # IMPORTANT:
+        # We do NOT enforce shadow-mode behavior on the duplicate responder path here.
+        # The canonical behavior is enforced on the single processor path that holds the claim
+        # and marks completed. This keeps "one writer" responsible for state mutations.
 
         # Act (safe execution) — act-level idempotency will be strengthened later
         try:
@@ -145,6 +163,7 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
                     "artifact_path": action_result.artifact_path,
                     "reason": action_result.reason,
                     "idempotency_key": idempotency_key,
+                    "shadow_mode": shadow_mode,
                 },
             )
         except Exception as e:
@@ -157,6 +176,7 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
                     "route": decision.route,
                     "error": str(e),
                     "idempotency_key": idempotency_key,
+                    "shadow_mode": shadow_mode,
                 },
             )
 
@@ -176,6 +196,7 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
             "owner_id": claim.owner_id,
             "is_late_event": event.is_late_event,
             "late_reason": event.late_reason,
+            "shadow_mode": shadow_mode,
         },
     )
 
@@ -193,11 +214,12 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
             "idempotency_key": idempotency_key,
             "is_late_event": event.is_late_event,
             "late_reason": event.late_reason,
+            "ordering_signal_missing": bool(ingest_req.metadata.get("ordering_signal_missing", False)),
+            "shadow_mode": shadow_mode,
         },
     )
 
-    # Cursor policy enforcement:
-    # If event is late, do NOT mutate external state (no Act). We still mark completed.
+    # 1) Governance no-op for late events (ordering enforcement)
     if event.is_late_event:
         idem_store.mark_completed(key=idempotency_key, owner_id=claim.owner_id or "unknown")
         log_event(
@@ -209,6 +231,23 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
                 "decision_id": decision.decision_id,
                 "owner_id": claim.owner_id,
                 "late_reason": event.late_reason,
+                "shadow_mode": shadow_mode,
+            },
+        )
+        return IngestResponse(event=event, decision=decision)
+
+    # 2) Shadow mode no-op (compute + log only; no Act, no cursor advance)
+    if shadow_mode:
+        idem_store.mark_completed(key=idempotency_key, owner_id=claim.owner_id or "unknown")
+        log_event(
+            logger,
+            event_name="shadow_mode_noop",
+            fields={
+                "idempotency_key": idempotency_key,
+                "event_id": event.event_id,
+                "decision_id": decision.decision_id,
+                "owner_id": claim.owner_id,
+                "route": decision.route,
             },
         )
         return IngestResponse(event=event, decision=decision)
@@ -244,7 +283,8 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
             },
         )
 
-        # Mailbox cursor advance (Gmail only), only after completion, only if not-late
+        # Mailbox cursor advance (Gmail only), only after completion, only if not-late and not shadow-mode
+        # Policy A: if history_id missing, we do not advance cursor.
         if ingest_req.source == "gmail":
             mailbox = ingest_req.payload.get("mailbox")
             history_id = ingest_req.payload.get("history_id")
@@ -261,6 +301,17 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
                         "event_id": event.event_id,
                     },
                 )
+            elif mailbox and not history_id:
+                log_event(
+                    logger,
+                    event_name="mailbox_cursor_missing_history_id",
+                    fields={
+                        "mailbox": mailbox,
+                        "idempotency_key": idempotency_key,
+                        "event_id": event.event_id,
+                        "ordering_signal_missing": True,
+                    },
+                )
 
     except Exception as e:
         # Explicit failure handling: mark failed so retries can reclaim deterministically
@@ -275,6 +326,7 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
                 "route": decision.route,
                 "error": str(e),
                 "owner_id": claim.owner_id,
+                "shadow_mode": shadow_mode,
             },
         )
         raise
@@ -339,6 +391,10 @@ def ingest_gmail(req: GmailIngestRequest) -> IngestResponse:
 
     canonical_req = normalize_gmail_ingest(req)
 
+    # Policy A: missing history_id is allowed but must be signaled deterministically.
+    ordering_signal_missing = req.history_id is None
+    canonical_req.metadata["ordering_signal_missing"] = ordering_signal_missing
+
     # Persist late-event determination into canonical metadata so _process_ingest can enforce no-op
     canonical_req.metadata["is_late_event"] = is_late_event
     canonical_req.metadata["late_reason"] = late_reason
@@ -365,6 +421,8 @@ def ingest_gmail(req: GmailIngestRequest) -> IngestResponse:
             "cursor_reason": cursor_check.reason,
             "cursor_incoming": cursor_check.incoming_history_id,
             "cursor_current": cursor_check.current_history_id,
+            "ordering_signal_missing": ordering_signal_missing,
+            "shadow_mode": _is_shadow_mode(),
         },
     )
 
