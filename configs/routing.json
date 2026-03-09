@@ -2,9 +2,66 @@
   "version": "1.0",
   "routes": [
     "NOOP_LATE_EVENT",
+    "NEEDS_REVIEW",
     "ESCALATE_HUMAN",
     "REQUEST_MORE_INFO",
     "CREATE_DRAFT_TICKET"
   ],
-  "rules": []
+  "categories": [],
+  "rules": [
+    {
+      "rule_id": "security_keyword_password",
+      "match_type": "keyword",
+      "field": null,
+      "value": "password",
+      "route": "ESCALATE_HUMAN",
+      "category": null,
+      "risk_level": "high"
+    },
+    {
+      "rule_id": "security_keyword_credential",
+      "match_type": "keyword",
+      "field": null,
+      "value": "credential",
+      "route": "ESCALATE_HUMAN",
+      "category": null,
+      "risk_level": "high"
+    },
+    {
+      "rule_id": "security_keyword_security",
+      "match_type": "keyword",
+      "field": null,
+      "value": "security",
+      "route": "ESCALATE_HUMAN",
+      "category": null,
+      "risk_level": "high"
+    },
+    {
+      "rule_id": "security_keyword_breach",
+      "match_type": "keyword",
+      "field": null,
+      "value": "breach",
+      "route": "ESCALATE_HUMAN",
+      "category": null,
+      "risk_level": "high"
+    },
+    {
+      "rule_id": "missing_urgency_request_more_info",
+      "match_type": "field_missing",
+      "field": "urgency",
+      "value": null,
+      "route": "REQUEST_MORE_INFO",
+      "category": null,
+      "risk_level": "medium"
+    },
+    {
+      "rule_id": "default_create_draft_ticket",
+      "match_type": "always",
+      "field": null,
+      "value": null,
+      "route": "CREATE_DRAFT_TICKET",
+      "category": null,
+      "risk_level": "low"
+    }
+  ]
 }
