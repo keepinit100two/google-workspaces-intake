@@ -1,0 +1,5 @@
+{
+  "version": "1.0",
+  "auto_route_threshold": 0.85,
+  "review_threshold": 0.60
+}

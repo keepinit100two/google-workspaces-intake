@@ -5,12 +5,13 @@ import uuid
 from fastapi import FastAPI, Header, HTTPException, Depends
 
 from app.core.auth import require_ops_api_key
-from app.core.config_loader import load_routing_config
+from app.core.config_loader import load_confidence_threshold_config, load_routing_config
 from app.core.cursor_store import get_mailbox_cursor_store
 from app.core.failure_sink import get_failure_sink, make_failure
 from app.core.idempotency_store import get_idempotency_store
 from app.core.logging import get_logger, log_event
 from app.domain.schemas import IngestRequest, IngestResponse, Event, GmailIngestRequest
+from app.services.llm_adapter import get_default_llm_classifier
 from app.services.normalizer import normalize_gmail_ingest
 from app.services.router import route_event
 from app.services.actuator import execute_decision
@@ -24,42 +25,63 @@ failure_sink = get_failure_sink()
 
 
 def _is_shadow_mode() -> bool:
-    """
-    Shadow mode = compute decisions + log, but do NOT execute Act or advance cursor.
-    Controlled via env var SHADOW_MODE.
-
-    Truthy values: "1", "true", "yes", "on"
-    """
     v = os.getenv("SHADOW_MODE", "").strip().lower()
     return v in {"1", "true", "yes", "on"}
 
 
+def _get_routing_config():
+    cfg = getattr(app.state, "routing_config", None)
+    if cfg is None:
+        cfg = load_routing_config()
+        app.state.routing_config = cfg
+    return cfg
+
+
+def _get_threshold_config():
+    cfg = getattr(app.state, "threshold_config", None)
+    if cfg is None:
+        cfg = load_confidence_threshold_config()
+        app.state.threshold_config = cfg
+    return cfg
+
+
+def _get_llm_classifier():
+    if not hasattr(app.state, "llm_classifier"):
+        app.state.llm_classifier = get_default_llm_classifier()
+    return app.state.llm_classifier
+
+
 @app.on_event("startup")
 def _startup_validate_configs() -> None:
-    """
-    Startup config validation gate.
-    Fail fast if policy-as-data configs are malformed.
-    """
     try:
         routing_cfg = load_routing_config()
-        app.state.routing_config = routing_cfg  # stored for future use by router
+        threshold_cfg = load_confidence_threshold_config()
+
+        app.state.routing_config = routing_cfg
+        app.state.threshold_config = threshold_cfg
+        app.state.llm_classifier = get_default_llm_classifier()
+
         log_event(
             logger,
             event_name="config_validated",
             fields={
-                "config": "routing.json",
-                "version": routing_cfg.version,
+                "routing_config": "routing.json",
+                "threshold_config": "confidence_thresholds.json",
+                "routing_version": routing_cfg.version,
+                "threshold_version": threshold_cfg.version,
                 "routes_count": len(routing_cfg.routes),
                 "rules_count": len(routing_cfg.rules),
+                "categories_count": len(routing_cfg.categories),
+                "llm_classifier_configured": app.state.llm_classifier is not None,
+                "auto_route_threshold": threshold_cfg.auto_route_threshold,
+                "review_threshold": threshold_cfg.review_threshold,
             },
         )
     except Exception as e:
-        # Explicit surfacing: no silent startup failure
         log_event(
             logger,
             event_name="config_validation_failed",
             fields={
-                "config": "routing.json",
                 "error": str(e),
             },
         )
@@ -68,22 +90,13 @@ def _startup_validate_configs() -> None:
                 stage="observe",
                 error_code="CONFIG_VALIDATION_FAILED",
                 message=str(e),
-                context={"config": "routing.json"},
+                context={},
             )
         )
-        # Crash startup intentionally (fail fast)
         raise
 
 
 def _gmail_idempotency_key(greq: GmailIngestRequest) -> str:
-    """
-    Deterministic idempotency key for Gmail ingest.
-
-    Priority:
-      1) message_id (best)
-      2) history_id (fallback for watch/history style ingestion)
-      3) else reject (cannot guarantee deterministic dedupe across retries)
-    """
     mailbox = greq.mailbox.strip().lower()
 
     if greq.message_id:
@@ -98,16 +111,6 @@ def _gmail_idempotency_key(greq: GmailIngestRequest) -> str:
 
 
 def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> IngestResponse:
-    """
-    Canonical ingest pipeline runner:
-      - enforce Idempotency-Key (or derived idempotency key for typed ingest endpoints)
-      - shared claim/lease (multi-server safe)
-      - Decide (router)
-      - Act v0 (safe execution) unless late-event or shadow mode
-      - mailbox cursor advance (if applicable) after successful completion
-      - structured logging
-      - returns {event, decision}
-    """
     if not idempotency_key:
         log_event(
             logger,
@@ -156,6 +159,10 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
         owner_id=None,
     )
 
+    routing_config = _get_routing_config()
+    threshold_config = _get_threshold_config()
+    llm_classifier = _get_llm_classifier()
+
     if not claim.claimed:
         existing_event = claim.existing_event or idem_store.get(idempotency_key) or candidate_event
 
@@ -173,7 +180,12 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
             },
         )
 
-        decision = route_event(existing_event)
+        decision = route_event(
+            existing_event,
+            routing_config=routing_config,
+            classifier=llm_classifier,
+            threshold_config=threshold_config,
+        )
         log_event(
             logger,
             event_name="decision_created",
@@ -185,11 +197,11 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
                 "reason": decision.reason,
                 "idempotency_key": idempotency_key,
                 "shadow_mode": shadow_mode,
+                "decision_source": decision.decision_source,
+                "category": decision.category,
+                "confidence": decision.confidence,
             },
         )
-
-        # We do not enforce shadow-mode on duplicate responder path.
-        # Single processor path is the source of truth for mutations and completion.
 
         try:
             action_result = execute_decision(existing_event, decision)
@@ -254,7 +266,12 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
         },
     )
 
-    decision = route_event(event)
+    decision = route_event(
+        event,
+        routing_config=routing_config,
+        classifier=llm_classifier,
+        threshold_config=threshold_config,
+    )
     log_event(
         logger,
         event_name="decision_created",
@@ -269,10 +286,15 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
             "late_reason": event.late_reason,
             "ordering_signal_missing": bool(ingest_req.metadata.get("ordering_signal_missing", False)),
             "shadow_mode": shadow_mode,
+            "decision_source": decision.decision_source,
+            "category": decision.category,
+            "confidence": decision.confidence,
+            "ai_final_status": decision.ai_final_status,
+            "ai_reject_reason": decision.ai_reject_reason,
+            "threshold_used": decision.threshold_used,
         },
     )
 
-    # Governance no-op for late events
     if event.is_late_event:
         idem_store.mark_completed(key=idempotency_key, owner_id=claim.owner_id or "unknown")
         log_event(
@@ -289,7 +311,6 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> I
         )
         return IngestResponse(event=event, decision=decision)
 
-    # Shadow-mode no-op
     if shadow_mode:
         idem_store.mark_completed(key=idempotency_key, owner_id=claim.owner_id or "unknown")
         log_event(

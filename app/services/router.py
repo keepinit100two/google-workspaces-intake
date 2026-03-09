@@ -1,7 +1,13 @@
 import uuid
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
-from app.core.config_loader import load_routing_config, RoutingRule
+from app.core.config_loader import (
+    ConfidenceThresholdConfig,
+    RoutingConfig,
+    RoutingRule,
+    load_confidence_threshold_config,
+    load_routing_config,
+)
 from app.domain.schemas import Event, Decision
 
 
@@ -13,10 +19,6 @@ def _get_payload(event: Event) -> Dict[str, Any]:
 
 
 def _get_text(event: Event) -> str:
-    """
-    Extract a best-effort text field from the event payload.
-    We keep this defensive because payloads vary across sources/domains.
-    """
     payload = _get_payload(event)
     text = payload.get("text")
     if isinstance(text, str):
@@ -25,13 +27,6 @@ def _get_text(event: Event) -> str:
 
 
 def _platform_rule_match(event: Event, allowed_routes: set[str]) -> Tuple[bool, str, str, Dict[str, Any], str]:
-    """
-    Platform safety rules (not client business policy).
-    Returns:
-      matched, route, reason, proposed_action, risk_level
-    """
-
-    # Platform Rule 1: Missing ordering signal should bias to human review
     ordering_signal_missing = bool(event.metadata.get("ordering_signal_missing", False))
     if ordering_signal_missing and "NEEDS_REVIEW" in allowed_routes:
         return (
@@ -45,7 +40,6 @@ def _platform_rule_match(event: Event, allowed_routes: set[str]) -> Tuple[bool, 
             "medium",
         )
 
-    # Platform Rule 2: Gmail payload missing message_id should bias to review
     payload = _get_payload(event)
     if event.source == "gmail" and payload.get("message_id") is None and "NEEDS_REVIEW" in allowed_routes:
         return (
@@ -63,10 +57,6 @@ def _platform_rule_match(event: Event, allowed_routes: set[str]) -> Tuple[bool, 
 
 
 def _rule_matches(event: Event, rule: RoutingRule) -> Tuple[bool, str, Dict[str, Any]]:
-    """
-    Returns:
-      matched, reason, details
-    """
     payload = _get_payload(event)
 
     if rule.match_type == "always":
@@ -112,21 +102,22 @@ def _rule_matches(event: Event, rule: RoutingRule) -> Tuple[bool, str, Dict[str,
     return False, f"unknown match_type '{rule.match_type}'", {"match_type": rule.match_type}
 
 
-def route_event(event: Event) -> Decision:
+def route_event(
+    event: Event,
+    routing_config: Optional[RoutingConfig] = None,
+    classifier=None,
+    threshold_config: Optional[ConfidenceThresholdConfig] = None,
+) -> Decision:
     """
-    Decide what should happen next for an Event using a deterministic routing stack.
-
     Order of precedence:
       D0) Governance override: late event -> NOOP_LATE_EVENT
       D1) Platform safety rules -> NEEDS_REVIEW
       D2) Config-driven deterministic rules -> first match wins
-      D3) Fallback -> NEEDS_REVIEW
-
-    This function performs NO side effects. It returns a reviewable plan only.
+      D3) LLM classification + confidence gating
+      D4) Fallback -> NEEDS_REVIEW
     """
     decision_id = str(uuid.uuid4())
 
-    # D0: Governance no-op for late events (ordering enforcement)
     if getattr(event, "is_late_event", False):
         return Decision(
             decision_id=decision_id,
@@ -146,10 +137,10 @@ def route_event(event: Event) -> Decision:
             rule_id=None,
         )
 
-    cfg = load_routing_config()
+    cfg = routing_config or load_routing_config()
+    thresholds = threshold_config or load_confidence_threshold_config()
     allowed_routes = set(cfg.routes)
 
-    # D1: Platform safety posture
     matched, route, reason, proposed_action, risk_level = _platform_rule_match(event, allowed_routes)
     if matched:
         return Decision(
@@ -166,7 +157,6 @@ def route_event(event: Event) -> Decision:
             rule_id=proposed_action.get("reason"),
         )
 
-    # D2: Config-driven deterministic rules
     for rule in cfg.rules:
         matched, reason, details = _rule_matches(event, rule)
         if matched:
@@ -196,7 +186,83 @@ def route_event(event: Event) -> Decision:
                 rule_id=rule.rule_id,
             )
 
-    # D3: Deterministic fallback
+    if classifier is not None:
+        outcome = classifier.classify(
+            text=_get_text(event),
+            allowed_categories=cfg.categories,
+        )
+
+        if outcome.accepted and outcome.classification is not None:
+            category = outcome.classification.category
+            confidence = outcome.classification.confidence
+
+            if confidence >= thresholds.auto_route_threshold:
+                mapped_route = cfg.category_routes.get(category, "NEEDS_REVIEW")
+                return Decision(
+                    decision_id=decision_id,
+                    event_id=event.event_id,
+                    route=mapped_route,
+                    reason="LLM classification accepted above auto-route threshold",
+                    risk_level="medium",
+                    proposed_action={
+                        "type": "llm_auto_route",
+                        "reason": "confidence_gated_accept",
+                        "llm_category": category,
+                    },
+                    category=category,
+                    decision_source="ai",
+                    confidence=confidence,
+                    threshold_used=thresholds.auto_route_threshold,
+                    rule_id=None,
+                    ai_attempts_count=len(outcome.attempts),
+                    ai_attempts=outcome.attempts,
+                    ai_final_status=outcome.final_status,
+                    ai_reject_reason=None,
+                )
+
+            return Decision(
+                decision_id=decision_id,
+                event_id=event.event_id,
+                route="NEEDS_REVIEW",
+                reason="LLM classification below auto-route threshold; requires human review",
+                risk_level="medium",
+                proposed_action={
+                    "type": "needs_review",
+                    "reason": "llm_below_threshold",
+                    "llm_category": category,
+                },
+                category=category,
+                decision_source="ai",
+                confidence=confidence,
+                threshold_used=thresholds.auto_route_threshold,
+                rule_id=None,
+                ai_attempts_count=len(outcome.attempts),
+                ai_attempts=outcome.attempts,
+                ai_final_status=outcome.final_status,
+                ai_reject_reason=None,
+            )
+
+        return Decision(
+            decision_id=decision_id,
+            event_id=event.event_id,
+            route="NEEDS_REVIEW",
+            reason="LLM classification rejected; requires human review",
+            risk_level="medium",
+            proposed_action={
+                "type": "needs_review",
+                "reason": "llm_rejected",
+            },
+            category=None,
+            decision_source="fallback",
+            confidence=None,
+            threshold_used=None,
+            rule_id=None,
+            ai_attempts_count=len(outcome.attempts),
+            ai_attempts=outcome.attempts,
+            ai_final_status=outcome.final_status,
+            ai_reject_reason=outcome.reject_reason,
+        )
+
     return Decision(
         decision_id=decision_id,
         event_id=event.event_id,

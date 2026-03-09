@@ -7,7 +7,20 @@
     "REQUEST_MORE_INFO",
     "CREATE_DRAFT_TICKET"
   ],
-  "categories": [],
+  "categories": [
+    "support",
+    "billing",
+    "security",
+    "sales",
+    "other"
+  ],
+  "category_routes": {
+    "support": "CREATE_DRAFT_TICKET",
+    "billing": "CREATE_DRAFT_TICKET",
+    "security": "ESCALATE_HUMAN",
+    "sales": "NEEDS_REVIEW",
+    "other": "NEEDS_REVIEW"
+  },
   "rules": [
     {
       "rule_id": "security_keyword_password",
@@ -15,7 +28,7 @@
       "field": null,
       "value": "password",
       "route": "ESCALATE_HUMAN",
-      "category": null,
+      "category": "security",
       "risk_level": "high"
     },
     {
@@ -24,7 +37,7 @@
       "field": null,
       "value": "credential",
       "route": "ESCALATE_HUMAN",
-      "category": null,
+      "category": "security",
       "risk_level": "high"
     },
     {
@@ -33,7 +46,7 @@
       "field": null,
       "value": "security",
       "route": "ESCALATE_HUMAN",
-      "category": null,
+      "category": "security",
       "risk_level": "high"
     },
     {
@@ -42,7 +55,7 @@
       "field": null,
       "value": "breach",
       "route": "ESCALATE_HUMAN",
-      "category": null,
+      "category": "security",
       "risk_level": "high"
     },
     {
@@ -51,7 +64,7 @@
       "field": "urgency",
       "value": null,
       "route": "REQUEST_MORE_INFO",
-      "category": null,
+      "category": "support",
       "risk_level": "medium"
     },
     {
@@ -60,7 +73,7 @@
       "field": null,
       "value": null,
       "route": "CREATE_DRAFT_TICKET",
-      "category": null,
+      "category": "support",
       "risk_level": "low"
     }
   ]
